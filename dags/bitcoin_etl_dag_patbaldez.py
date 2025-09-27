@@ -1,91 +1,108 @@
-# Mantenha todas as suas importações no topo
+# dags/bitcoin_etl_dag_patbaldez.py
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import pandera as pa
-from datetime import datetime
 import pandas_gbq
-import os
-import functions_framework # Importar para Cloud Functions/Run
 
-# --- Mantenha suas configurações globais (PROJECT_ID, DATASET_ID, TABLE_NAME) aqui ---
-# ATENÇÃO: Substitua 'patbigcoin' pelo seu Project ID real do Google Cloud
+default_args = {
+    'owner': 'patbaldez',
+    'depends_on_past': False,
+    'start_date': datetime(2023, 1, 1),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
+}
+
 PROJECT_ID = 'patbigcoin'
 DATASET_ID = 'bitcoin_data_patbaldez'
-TABLE_NAME = f'cotacoes_bitcoin_patbaldez'
+TABLE_NAME = 'cotacoes_bitcoin_patbaldez'
 
-# --- Mantenha seu bitcoin_schema aqui ---
-bitcoin_schema = pa.DataFrameSchema(
-    columns={
-        "data_hora": pa.Column(pa.DateTime, nullable=False),
-        "timestamp": pa.Column(pa.Int, nullable=False),
-        "preco": pa.Column(float, checks=pa.Check.greater_than(0), nullable=False),
-        "data": pa.Column(pa.String, nullable=False),
-    },
-    unique=["data_hora"],
-    strict=True
-)
-
-# --- Mantenha suas funções extrair_dados_bitcoin_func, validar_e_transformar_dados_func, carregar_dados_no_bigquery_func aqui ---
-def extrair_dados_bitcoin_func(moeda='usd', dias=180):
-    print(f"Extraindo dados do Bitcoin para os últimos {dias} dias (moeda: {moeda})...")
-    url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+def extract_bitcoin_data():
+    """Extrai dados do Bitcoin da CoinGecko API"""
+    print("Extraindo dados do Bitcoin...")
+    url = 'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart'
     params = {
-        'vs_currency': moeda,
-        'days': dias,
+        'vs_currency': 'usd',
+        'days': 180,
         'interval': 'daily'
     }
+    
     response = requests.get(url, params=params)
     response.raise_for_status()
     data = response.json()
-    precos = data['prices']
-    df = pd.DataFrame(precos, columns=['timestamp', 'preco'])
-    df['data_hora'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['data'] = df['data_hora'].dt.date.astype(str)
-    df = df[['data_hora', 'timestamp', 'preco', 'data']]
-    print("Extração concluída com sucesso!")
-    return df.to_json(date_format='iso', orient='records')
+    prices = data['prices']
+    
+    df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['date_str'] = df['date'].dt.strftime('%Y-%m-%d')
+    
+    print(f"Extraídos {len(df)} registros")
+    return df.to_dict('records')
 
-def validar_e_transformar_dados_func(df_json):
-    print("Validando e transformando dados...")
-    df = pd.read_json(df_json)
-    try:
-        validated_df = bitcoin_schema.validate(df)
-        print("Dados validados com Pandera com sucesso!")
-    except pa.errors.SchemaErrors as err:
-        print("Erros de validação de esquema encontrados:")
-        print(err.failure_cases)
-        raise
-    validated_df.set_index('data_hora', inplace=True)
-    print("Transformação concluída com sucesso!")
-    return validated_df.to_json(date_format='iso', orient='records')
+def validate_data(**context):
+    """Valida os dados com Pandera"""
+    ti = context['ti']
+    data = ti.xcom_pull(task_ids='extract_data')
+    df = pd.DataFrame(data)
+    
+    # Schema de validação
+    schema = pa.DataFrameSchema({
+        "timestamp": pa.Column(pa.Int64, nullable=False),
+        "price": pa.Column(pa.Float, checks=pa.Check.greater_than(0)),
+        "date": pa.Column(pa.DateTime, nullable=False),
+        "date_str": pa.Column(pa.String, nullable=False)
+    })
+    
+    validated_df = schema.validate(df)
+    print("Dados validados com sucesso!")
+    return validated_df.to_dict('records')
 
-def carregar_dados_no_bigquery_func(df_json, project_id, dataset_id, table_name):
-    print(f"Carregando dados para BigQuery no projeto {project_id}, dataset {dataset_id}, tabela {table_name}...")
-    df = pd.read_json(df_json)
-    if df.empty:
-        print("DataFrame está vazio. Nenhuma carga será realizada.")
-        return
-    df['preco'] = df['preco'].astype(float)
-    table_id = f'{dataset_id}.{table_name}'
+def load_to_bigquery(**context):
+    """Carrega dados para o BigQuery"""
+    ti = context['ti']
+    data = ti.xcom_pull(task_ids='validate_data')
+    df = pd.DataFrame(data)
+    
+    # Prepara os dados para BigQuery
+    df_bq = df[['date_str', 'price', 'timestamp']].copy()
+    df_bq.columns = ['data', 'preco', 'timestamp']
+    
+    table_id = f"{DATASET_ID}.{TABLE_NAME}"
+    
     pandas_gbq.to_gbq(
-        df,
-        destination_table=table_id,
-        project_id=project_id,
-        if_exists='replace',
-        progress_bar=False
+        df_bq,
+        table_id,
+        project_id=PROJECT_ID,
+        if_exists='replace'
     )
-    print("Dados carregados no BigQuery com sucesso!")
+    print(f"Dados carregados para {table_id}")
 
-# --- FUNÇÃO PRINCIPAL PARA O CLOUD RUN ---
-@functions_framework.http
-def run_bitcoin_etl(request):
-    print("Iniciando o pipeline ETL do Bitcoin no Cloud Run...")
-    try:
-        extracted_data_json = extrair_dados_bitcoin_func(moeda='usd', dias=180)
-        transformed_data_json = validar_e_transformar_dados_func(extracted_data_json)
-        carregar_dados_no_bigquery_func(transformed_data_json, PROJECT_ID, DATASET_ID, TABLE_NAME)
-        print("Pipeline ETL do Bitcoin concluído com sucesso!")
-        return 'ETL do Bitcoin executado com sucesso!', 200
-    except Exception as e:
-        print(f"Erro durante a execução do ETL: {e}")
-        return f'Erro durante o ETL: {e}', 500
+# Definição da DAG
+with DAG(
+    'bitcoin_etl_patbaldez',
+    default_args=default_args,
+    description='ETL para dados do Bitcoin - PatBaldez',
+    schedule_interval='@daily',
+    catchup=False,
+    tags=['bitcoin', 'etl', 'patbaldez']
+) as dag:
+    
+    extract_task = PythonOperator(
+        task_id='extract_data',
+        python_callable=extract_bitcoin_data
+    )
+    
+    validate_task = PythonOperator(
+        task_id='validate_data',
+        python_callable=validate_data
+    )
+    
+    load_task = PythonOperator(
+        task_id='load_to_bigquery',
+        python_callable=load_to_bigquery
+    )
+    
+    # Ordem de execução
+    extract_task >> validate_task >> load_task
